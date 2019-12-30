@@ -11,9 +11,6 @@
 
 use jsonrpc_core as rpc;
 
-/// Re-export of the `futures` crate.
-#[macro_use]
-pub extern crate futures;
 
 // it needs to be before other modules
 // otherwise the macro for tests is not available.
