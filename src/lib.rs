@@ -16,6 +16,8 @@ use jsonrpc_core as rpc;
 #[macro_use]
 pub extern crate futures;
 
+pub extern crate ethereum-types;
+
 // it needs to be before other modules
 // otherwise the macro for tests is not available.
 #[macro_use]
