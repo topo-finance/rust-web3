@@ -7,16 +7,15 @@ use crate::types::{
     Address, Bytes, Recovery, RecoveryMessage, SignedData, SignedTransaction, TransactionParameters, H256, U256,
 };
 use crate::Transport;
+use ethereum_transaction::{
+    Bytes as EthtxBytes, SignTransaction, SignedTransaction as EthtxSignedTransaction, Transaction,
+};
+use ethsign::{Error as EthsignError, SecretKey};
 use futures::future::{self, Either, FutureResult, Join3};
 use futures::{Async, Future, Poll};
-use rlp::RlpStream;
-use secp256k1::key::ONE_KEY;
-use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
-use std::convert::TryInto;
+use parity_crypto::Keccak256;
+use std::borrow::Cow;
 use std::mem;
-use std::ops::Deref;
-use tiny_keccak::{Hasher, Keccak};
-use zeroize::{DefaultIsZeroes, Zeroize};
 
 /// `Accounts` namespace
 #[derive(Debug, Clone)]
@@ -59,10 +58,10 @@ impl<T: Transport> Accounts<T> {
     {
         let message = message.as_ref();
 
-        let mut eth_message = format!("\x19Ethereum Signed Message:\n{}", message.len()).into_bytes();
+        let mut eth_message = Vec::from(format!("\x19Ethereum Signed Message:\n{}", message.len()).as_bytes());
         eth_message.extend_from_slice(message);
 
-        keccak256(&eth_message).into()
+        eth_message.keccak256().into()
     }
 
     /// Sign arbitrary string data.
@@ -71,25 +70,23 @@ impl<T: Transport> Accounts<T> {
     /// `hash_message`. The returned signed data's signature is in 'Electrum'
     /// notation, that is the recovery value `v` is either `27` or `28` (as
     /// opposed to the standard notation where `v` is either `0` or `1`). This
-    /// is important to consider when using this signature with other crates.
-    pub fn sign<S>(&self, message: S, key: &SecretKey) -> SignedData
+    /// is important to consider when using this signature with other crates
+    /// such as `ethsign`.
+    pub fn sign<S>(&self, message: S, key: &SecretKey) -> Result<SignedData, Error>
     where
         S: AsRef<[u8]>,
     {
         let message = message.as_ref();
         let message_hash = self.hash_message(message);
 
-        let sig_message = Message::from_slice(message_hash.as_bytes()).expect("hash is non-zero 32-bytes; qed");
-        let signature = sign(&sig_message, key, None);
-        let v = signature
-            .v
-            .try_into()
-            .expect("signature recovery in electrum notation always fits in a u8");
+        let signature = key.sign(&message_hash[..]).map_err(EthsignError::from)?;
+        // convert to 'Electrum' notation
+        let v = signature.v + 27;
 
         let signature_bytes = Bytes({
             let mut bytes = Vec::with_capacity(65);
-            bytes.extend_from_slice(signature.r.as_bytes());
-            bytes.extend_from_slice(signature.s.as_bytes());
+            bytes.extend_from_slice(&signature.r[..]);
+            bytes.extend_from_slice(&signature.s[..]);
             bytes.push(v);
             bytes
         });
@@ -97,14 +94,14 @@ impl<T: Transport> Accounts<T> {
         // We perform this allocation only after all previous fallible actions have completed successfully.
         let message = message.to_owned();
 
-        SignedData {
+        Ok(SignedData {
             message,
             message_hash,
             v,
-            r: signature.r,
-            s: signature.s,
+            r: signature.r.into(),
+            s: signature.s.into(),
             signature: signature_bytes,
-        }
+        })
     }
 
     /// Recovers the Ethereum address which was used to sign the given data.
@@ -120,50 +117,17 @@ impl<T: Transport> Accounts<T> {
             RecoveryMessage::Data(ref message) => self.hash_message(message),
             RecoveryMessage::Hash(hash) => hash,
         };
-        let signature = recovery.as_signature()?;
+        let signature = recovery.as_signature();
 
-        let message = Message::from_slice(message_hash.as_bytes())?;
-        let public_key = Secp256k1::verification_only().recover(&message, &signature)?;
+        let public_key = signature.recover(&message_hash[..]).map_err(EthsignError::from)?;
 
-        Ok(public_key_address(&public_key))
+        Ok(public_key.address().into())
     }
-}
-
-/// Compute the Keccak-256 hash of input bytes.
-pub fn keccak256(bytes: &[u8]) -> [u8; 32] {
-    let mut output = [0u8; 32];
-    let mut hasher = Keccak::v256();
-    hasher.update(bytes);
-    hasher.finalize(&mut output);
-    output
-}
-
-/// Gets the public address of a private key.
-fn secret_key_address(key: &SecretKey) -> Address {
-    let secp = Secp256k1::signing_only();
-    let public_key = PublicKey::from_secret_key(&secp, key);
-    public_key_address(&public_key)
-}
-
-/// Gets the address of a public key.
-///
-/// The public address is defined as the low 20 bytes of the keccak hash of
-/// the public key. Note that the public key returned from the `secp256k1`
-/// crate is 65 bytes long, that is because it is prefixed by `0x04` to
-/// indicate an uncompressed public key; this first byte is ignored when
-/// computing the hash.
-fn public_key_address(public_key: &PublicKey) -> Address {
-    let public_key = public_key.serialize_uncompressed();
-
-    debug_assert_eq!(public_key[0], 0x04);
-    let hash = keccak256(&public_key[1..]);
-
-    Address::from_slice(&hash[12..])
 }
 
 type MaybeReady<T, R> = Either<FutureResult<R, Error>, CallFuture<R, <T as Transport>::Out>>;
 
-type TxParams<T> = Join3<MaybeReady<T, U256>, MaybeReady<T, U256>, MaybeReady<T, U256>>;
+type TxParams<T> = Join3<MaybeReady<T, U256>, MaybeReady<T, U256>, MaybeReady<T, String>>;
 
 /// Future resolving when transaction signing is complete.
 ///
@@ -173,7 +137,7 @@ type TxParams<T> = Join3<MaybeReady<T, U256>, MaybeReady<T, U256>, MaybeReady<T,
 /// immediately.
 pub struct SignTransactionFuture<T: Transport> {
     tx: TransactionParameters,
-    key: ZeroizeSecretKey,
+    key: SecretKey,
     inner: TxParams<T>,
 }
 
@@ -189,16 +153,19 @@ impl<T: Transport> SignTransactionFuture<T> {
             };
         }
 
-        let from = secret_key_address(key);
+        let from = key.public().address().into();
         let inner = Future::join3(
             maybe!(tx.nonce, accounts.web3().eth().transaction_count(from, None)),
             maybe!(tx.gas_price, accounts.web3().eth().gas_price()),
-            maybe!(tx.chain_id.map(U256::from), accounts.web3().eth().chain_id()),
+            // TODO(nlordell): avoid converting chain ID to and from string,
+            //   this will require wrapping the `Net::version()` call to convert
+            //   the result from a string to a u64
+            maybe!(tx.chain_id.map(|id| id.to_string()), accounts.web3().net().version()),
         );
 
         SignTransactionFuture {
             tx,
-            key: ZeroizeSecretKey(*key),
+            key: key.clone(),
             inner,
         }
     }
@@ -210,164 +177,54 @@ impl<T: Transport> Future for SignTransactionFuture<T> {
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let (nonce, gas_price, chain_id) = try_ready!(self.inner.poll());
-        let chain_id = chain_id.as_u64();
+        let chain_id = chain_id.parse::<u64>().map_err(|e| Error::Decoder(e.to_string()))?;
 
         let data = mem::replace(&mut self.tx.data, Bytes::default());
         let tx = Transaction {
+            from: Address::zero(), // not used for signing.
             to: self.tx.to,
             nonce,
             gas: self.tx.gas,
             gas_price,
             value: self.tx.value,
-            data: data.0,
+            data: EthtxBytes(data.0),
         };
-        let signed = tx.sign(&self.key, chain_id);
+        let signed = sign_transaction(tx, &self.key, chain_id)?;
 
         Ok(Async::Ready(signed))
     }
 }
 
-impl<T: Transport> Drop for SignTransactionFuture<T> {
-    fn drop(&mut self) {
-        self.key.zeroize();
-    }
-}
-
-/// A struct that represents a the components of a secp256k1 signature.
-struct Signature {
-    v: u64,
-    r: H256,
-    s: H256,
-}
-
-/// Sign a message with a secret key and optional chain ID.
-///
-/// When a chain ID is provided, the `Signature`'s V-value will have chain relay
-/// protection added (as per EIP-155). Otherwise, the V-value will be in
-/// 'Electrum' notation.
-fn sign(message: &Message, key: &SecretKey, chain_id: Option<u64>) -> Signature {
-    let (recovery_id, signature) = Secp256k1::signing_only()
-        .sign_recoverable(message, key)
-        .serialize_compact();
-
-    let standard_v = recovery_id.to_i32() as u64;
-    let v = if let Some(chain_id) = chain_id {
-        // When signing with a chain ID, add chain replay protection.
-        standard_v + 35 + chain_id * 2
-    } else {
-        // Otherwise, convert to 'Electrum' notation.
-        standard_v + 27
+/// Sign and return a raw signed transaction.
+fn sign_transaction(tx: Transaction, key: &SecretKey, chain_id: u64) -> Result<SignedTransaction, EthsignError> {
+    let tx = SignTransaction {
+        transaction: Cow::Owned(tx),
+        chain_id,
     };
-    let r = H256::from_slice(&signature[..32]);
-    let s = H256::from_slice(&signature[32..]);
 
-    Signature { v, r, s }
+    let hash = tx.hash();
+    let sig = key.sign(&hash[..])?;
+
+    let signed_tx = EthtxSignedTransaction::new(tx.transaction, tx.chain_id, sig.v, sig.r, sig.s);
+    let transaction_hash = signed_tx.hash().into();
+    let raw_transaction = Bytes(signed_tx.to_rlp());
+
+    Ok(SignedTransaction {
+        message_hash: hash.into(),
+        v: signed_tx.v,
+        r: sig.r.into(),
+        s: sig.s.into(),
+        raw_transaction,
+        transaction_hash,
+    })
 }
-
-/// A transaction used for RLP encoding, hashing and signing.
-struct Transaction {
-    to: Option<Address>,
-    nonce: U256,
-    gas: U256,
-    gas_price: U256,
-    value: U256,
-    data: Vec<u8>,
-}
-
-impl Transaction {
-    /// RLP encode an unsigned transaction for the specified chain ID.
-    fn rlp_append_unsigned(&self, rlp: &mut RlpStream, chain_id: u64) {
-        rlp.begin_list(9);
-        rlp.append(&self.nonce);
-        rlp.append(&self.gas_price);
-        rlp.append(&self.gas);
-        if let Some(to) = self.to {
-            rlp.append(&to);
-        } else {
-            rlp.append(&"");
-        }
-        rlp.append(&self.value);
-        rlp.append(&self.data);
-        rlp.append(&chain_id);
-        rlp.append(&0u8);
-        rlp.append(&0u8);
-    }
-
-    /// RLP encode a signed transaction with the specified signature.
-    fn rlp_append_signed(&self, rlp: &mut RlpStream, signature: &Signature) {
-        rlp.begin_list(9);
-        rlp.append(&self.nonce);
-        rlp.append(&self.gas_price);
-        rlp.append(&self.gas);
-        if let Some(to) = self.to {
-            rlp.append(&to);
-        } else {
-            rlp.append(&"");
-        }
-        rlp.append(&self.value);
-        rlp.append(&self.data);
-        rlp.append(&signature.v);
-        rlp.append(&U256::from_big_endian(signature.r.as_bytes()));
-        rlp.append(&U256::from_big_endian(signature.s.as_bytes()));
-    }
-
-    /// Sign and return a raw signed transaction.
-    fn sign(self, key: &SecretKey, chain_id: u64) -> SignedTransaction {
-        let mut rlp = RlpStream::new();
-        self.rlp_append_unsigned(&mut rlp, chain_id);
-
-        let hash = keccak256(rlp.as_raw());
-        let message = Message::from_slice(&hash).expect("hash is non-zero 32-bytes; qed");
-        let signature = sign(&message, key, Some(chain_id));
-
-        rlp.clear();
-        self.rlp_append_signed(&mut rlp, &signature);
-
-        let transaction_hash = keccak256(rlp.as_raw()).into();
-        let raw_transaction = rlp.out().into();
-
-        SignedTransaction {
-            message_hash: hash.into(),
-            v: signature.v,
-            r: signature.r,
-            s: signature.s,
-            raw_transaction,
-            transaction_hash,
-        }
-    }
-}
-
-/// A wrapper type around `SecretKey` to prevent leaking secret key data. This
-/// type will properly zeroize the secret key to `ONE_KEY` in a way that will
-/// not get optimized away by the compiler nor be prone to leaks that take
-/// advantage of access reordering.
-///
-/// This is required since the `SignTransactionFuture` needs to retain a copy
-/// of the `SecretKey`.
-#[derive(Clone, Copy)]
-struct ZeroizeSecretKey(SecretKey);
-
-impl Default for ZeroizeSecretKey {
-    fn default() -> Self {
-        ZeroizeSecretKey(ONE_KEY)
-    }
-}
-
-impl Deref for ZeroizeSecretKey {
-    type Target = SecretKey;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DefaultIsZeroes for ZeroizeSecretKey {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::helpers::tests::TestTransport;
     use crate::types::Bytes;
+    use ethsign::SecretKey;
     use rustc_hex::FromHex;
     use serde_json::json;
 
@@ -382,13 +239,14 @@ mod tests {
             gas: 2_000_000.into(),
             ..Default::default()
         };
-        let key: SecretKey = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+        let secret: H256 = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
             .parse()
             .unwrap();
+        let key = SecretKey::from_raw(&secret[..]).unwrap();
         let nonce = U256::zero();
         let gas_price = U256::from(21_000_000_000u128);
-        let chain_id = "0x1";
-        let from: Address = secret_key_address(&key);
+        let chain_id = "1";
+        let from: Address = key.public().address().into();
 
         let mut transport = TestTransport::default();
         transport.add_response(json!(nonce));
@@ -405,7 +263,7 @@ mod tests {
             &[json!(from).to_string(), json!("latest").to_string()],
         );
         transport.assert_request("eth_gasPrice", &[]);
-        transport.assert_request("eth_chainId", &[]);
+        transport.assert_request("net_version", &[]);
         transport.assert_no_more_requests();
 
         let expected = SignedTransaction {
@@ -434,9 +292,10 @@ mod tests {
 
     #[test]
     fn accounts_sign_transaction_with_all_parameters() {
-        let key: SecretKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-            .parse()
+        let secret: Vec<u8> = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+            .from_hex()
             .unwrap();
+        let key = SecretKey::from_raw(&secret).unwrap();
 
         let accounts = Accounts::new(TestTransport::default());
         accounts
@@ -482,10 +341,11 @@ mod tests {
 
         let accounts = Accounts::new(TestTransport::default());
 
-        let key: SecretKey = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
-            .parse()
+        let secret: Vec<u8> = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+            .from_hex()
             .unwrap();
-        let signed = accounts.sign("Some data", &key);
+        let key = SecretKey::from_raw(&secret).unwrap();
+        let signed = accounts.sign("Some data", &key).unwrap();
 
         assert_eq!(
             signed.message_hash,
@@ -531,14 +391,15 @@ mod tests {
 
     #[test]
     fn accounts_recover_signed() {
-        let key: SecretKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
-            .parse()
+        let secret: Vec<u8> = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+            .from_hex()
             .unwrap();
-        let address: Address = secret_key_address(&key);
+        let key = SecretKey::from_raw(&secret).unwrap();
+        let address: Address = key.public().address().into();
 
         let accounts = Accounts::new(TestTransport::default());
 
-        let signed = accounts.sign("rust-web3 rocks!", &key);
+        let signed = accounts.sign("rust-web3 rocks!", &key).unwrap();
         let recovered = accounts.recover(&signed).unwrap();
         assert_eq!(recovered, address);
 
@@ -562,23 +423,27 @@ mod tests {
     }
 
     #[test]
-    fn sign_transaction_data() {
+    fn sign_ethtx_transaction() {
         // retrieved test vector from:
         // https://web3js.readthedocs.io/en/v1.2.2/web3-eth-accounts.html#eth-accounts-signtransaction
 
         let tx = Transaction {
+            from: Default::default(), // not used for signing
             nonce: 0.into(),
             gas: 2_000_000.into(),
             gas_price: 234_567_897_654_321u64.into(),
             to: Some("F0109fC8DF283027b6285cc889F5aA624EaC1F55".parse().unwrap()),
             value: 1_000_000_000.into(),
-            data: Vec::new(),
+            data: EthtxBytes(Vec::new()),
         };
-        let key: SecretKey = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
-            .parse()
-            .unwrap();
+        let key = {
+            let raw: H256 = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+                .parse()
+                .unwrap();
+            SecretKey::from_raw(&raw[..]).expect("valid key")
+        };
 
-        let signed = tx.sign(&key, 1);
+        let signed = sign_transaction(tx, &key, 1).unwrap();
 
         let expected = SignedTransaction {
             message_hash: "6893a6ee8df79b0f5d64a180cd1ef35d030f3e296a5361cf04d02ce720d32ec5"
